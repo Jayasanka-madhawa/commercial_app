@@ -41,8 +41,8 @@ class Product(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name: Mapped[str] = mapped_column(String)
     price_cents: Mapped[int] = mapped_column(Integer)
-    # NEW:
     category_id: Mapped[str | None] = mapped_column(String, ForeignKey("categories.id"), nullable=True)
+    inventory: Mapped[int] = mapped_column(Integer, default=0)  # NEW
 
 class Order(Base):
     __tablename__ = "orders"
@@ -88,7 +88,8 @@ class CategoryOut(BaseModel):
 class ProductIn(BaseModel):
     name: str
     price_cents: int
-    category_id: str | None = None  # NEW
+    category_id: str | None = None
+    inventory: int = 0                         # NEW
 
 class ProductOut(ProductIn):
     id: str
@@ -107,6 +108,10 @@ class OrderOut(BaseModel):
     status: str
     created_at: dt.datetime
     items: List[dict]  # [{product_id, name, price_cents, qty}]
+
+class InventoryPatch(BaseModel):
+    delta: int  # e.g., +10 to add stock, -2 to remove
+
 
 
 # ======== Auth helpers ========
@@ -188,7 +193,12 @@ def get_product(pid: str, db: Session = Depends(get_db)):
 # Protected writes (make delete admin-only to demo roles)
 @app.post("/products", response_model=ProductOut)
 def create_product(body: ProductIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    p = Product(name=body.name, price_cents=body.price_cents)
+    p = Product(
+        name=body.name,
+        price_cents=body.price_cents,
+        category_id=body.category_id,
+        inventory=body.inventory,
+    )
     db.add(p); db.commit(); db.refresh(p)
     return p
 
@@ -204,21 +214,36 @@ def create_order(body: OrderIn, user: User = Depends(get_current_user), db: Sess
     if not body.items:
         raise HTTPException(400, "Cart is empty")
 
-    # Build normalized items from DB (trust server-side prices)
     normalized = []
     total = 0
+
+    # 1) validate availability
+    prods = {}
     for it in body.items:
         p = db.get(Product, it.product_id)
         if not p:
             raise HTTPException(400, f"Invalid product: {it.product_id}")
-        line_total = p.price_cents * it.qty
+        if it.qty <= 0:
+            raise HTTPException(400, "Quantity must be >= 1")
+        if p.inventory < it.qty:
+            raise HTTPException(400, f"Insufficient stock for {p.name} (have {p.inventory}, need {it.qty})")
+        prods[it.product_id] = p
+
+    # 2) build normalized items & compute total
+    for it in body.items:
+        p = prods[it.product_id]
         normalized.append({
             "product_id": p.id,
             "name": p.name,
             "price_cents": p.price_cents,
             "qty": it.qty,
         })
-        total += line_total
+        total += p.price_cents * it.qty
+
+    # 3) decrement stock
+    for it in body.items:
+        p = prods[it.product_id]
+        p.inventory -= it.qty
 
     order = Order(
         user_id=user.id,
@@ -226,7 +251,9 @@ def create_order(body: OrderIn, user: User = Depends(get_current_user), db: Sess
         total_cents=total,
         status="pending",
     )
-    db.add(order); db.commit(); db.refresh(order)
+    db.add(order)
+    db.commit()
+    db.refresh(order)
 
     return OrderOut(
         id=order.id,
@@ -235,6 +262,7 @@ def create_order(body: OrderIn, user: User = Depends(get_current_user), db: Sess
         created_at=order.created_at,
         items=normalized
     )
+
 
 @app.get("/orders", response_model=List[OrderOut])
 def list_orders(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -263,4 +291,21 @@ def create_category(body: CategoryIn, _: User = Depends(require_admin), db: Sess
     c = Category(name=body.name, slug=body.slug)
     db.add(c); db.commit(); db.refresh(c)
     return c
+
+@app.patch("/products/{pid}/inventory")
+def patch_inventory(
+    pid: str,
+    body: InventoryPatch,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    p = db.get(Product, pid)
+    if not p:
+        raise HTTPException(404, "Not found")
+    new_qty = p.inventory + body.delta
+    if new_qty < 0:
+        raise HTTPException(400, f"Inventory cannot be negative (current {p.inventory}, delta {body.delta})")
+    p.inventory = new_qty
+    db.commit()
+    return {"ok": True, "inventory": p.inventory}
 
