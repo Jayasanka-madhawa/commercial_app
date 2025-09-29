@@ -4,9 +4,11 @@ from pydantic import BaseModel
 from typing import List, Optional
 from jose import jwt, JWTError
 from passlib.context import CryptContext
-from sqlalchemy import create_engine, String, Integer, UniqueConstraint, select
+from sqlalchemy import create_engine, String, Integer, UniqueConstraint, select ,DateTime, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session, sessionmaker
 import uuid, time, os
+import json, datetime as dt
+
 
 # ======== Config ========
 JWT_SECRET = os.getenv("JWT_SECRET", "fe466eef482c7def2809f1e80026aa72bcbfcbecd47edada521737ce4a8759d8")  # set a strong secret in env for real use
@@ -33,6 +35,16 @@ class Product(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name: Mapped[str] = mapped_column(String)
     price_cents: Mapped[int] = mapped_column(Integer)
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    items_json: Mapped[str] = mapped_column(Text)  # JSON array of items
+    total_cents: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending, paid, shipped, cancelled
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.utcnow())
+
 
 Base.metadata.create_all(engine)
 
@@ -62,6 +74,21 @@ class ProductIn(BaseModel):
 class ProductOut(ProductIn):
     id: str
     class Config: from_attributes = True
+
+class OrderItem(BaseModel):
+    product_id: str
+    qty: int
+
+class OrderIn(BaseModel):
+    items: List[OrderItem]
+
+class OrderOut(BaseModel):
+    id: str
+    total_cents: int
+    status: str
+    created_at: dt.datetime
+    items: List[dict]  # [{product_id, name, price_cents, qty}]
+
 
 # ======== Auth helpers ========
 def make_access_token(sub: str, role: str, ttl=ACCESS_TTL):
@@ -142,3 +169,57 @@ def delete_product(pid: str, _: User = Depends(require_admin), db: Session = Dep
     if not p: raise HTTPException(404, "Not found")
     db.delete(p); db.commit()
     return {"ok": True}
+
+@app.post("/orders", response_model=OrderOut)
+def create_order(body: OrderIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not body.items:
+        raise HTTPException(400, "Cart is empty")
+
+    # Build normalized items from DB (trust server-side prices)
+    normalized = []
+    total = 0
+    for it in body.items:
+        p = db.get(Product, it.product_id)
+        if not p:
+            raise HTTPException(400, f"Invalid product: {it.product_id}")
+        line_total = p.price_cents * it.qty
+        normalized.append({
+            "product_id": p.id,
+            "name": p.name,
+            "price_cents": p.price_cents,
+            "qty": it.qty,
+        })
+        total += line_total
+
+    order = Order(
+        user_id=user.id,
+        items_json=json.dumps(normalized),
+        total_cents=total,
+        status="pending",
+    )
+    db.add(order); db.commit(); db.refresh(order)
+
+    return OrderOut(
+        id=order.id,
+        total_cents=order.total_cents,
+        status=order.status,
+        created_at=order.created_at,
+        items=normalized
+    )
+
+@app.get("/orders", response_model=List[OrderOut])
+def list_orders(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    rows = db.execute(
+        select(Order).where(Order.user_id == user.id).order_by(Order.created_at.desc())
+    ).scalars().all()
+    out = []
+    for o in rows:
+        out.append(OrderOut(
+            id=o.id,
+            total_cents=o.total_cents,
+            status=o.status,
+            created_at=o.created_at,
+            items=json.loads(o.items_json)
+        ))
+    return out
+
