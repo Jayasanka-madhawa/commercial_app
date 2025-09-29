@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from jose import jwt, JWTError
 from passlib.context import CryptContext
-from sqlalchemy import create_engine, String, Integer, UniqueConstraint, select ,DateTime, Text
+from sqlalchemy import create_engine, String, Integer, UniqueConstraint, select ,DateTime, Text ,ForeignKey
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session, sessionmaker
 import uuid, time, os
 import json, datetime as dt
@@ -30,11 +30,19 @@ class User(Base):
     role: Mapped[str] = mapped_column(String, default="user")  # user/admin
     __table_args__ = (UniqueConstraint("email", name="uq_user_email"),)
 
+class Category(Base):
+    __tablename__ = "categories"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name: Mapped[str] = mapped_column(String, index=True)
+    slug: Mapped[str] = mapped_column(String, unique=True, index=True)
+
 class Product(Base):
     __tablename__ = "products"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name: Mapped[str] = mapped_column(String)
     price_cents: Mapped[int] = mapped_column(Integer)
+    # NEW:
+    category_id: Mapped[str | None] = mapped_column(String, ForeignKey("categories.id"), nullable=True)
 
 class Order(Base):
     __tablename__ = "orders"
@@ -67,9 +75,20 @@ class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
 
+class CategoryIn(BaseModel):
+    name: str
+    slug: str
+
+class CategoryOut(BaseModel):
+    id: str
+    name: str
+    slug: str
+    class Config: from_attributes = True
+
 class ProductIn(BaseModel):
     name: str
     price_cents: int
+    category_id: str | None = None  # NEW
 
 class ProductOut(ProductIn):
     id: str
@@ -147,8 +166,18 @@ def me(user: User = Depends(get_current_user)):
 
 # --- Products ---
 @app.get("/products", response_model=List[ProductOut])
-def list_products(db: Session = Depends(get_db)):
-    return db.query(Product).all()
+def list_products(
+    q: str | None = None,
+    category_id: str | None = None,
+    db: Session = Depends(get_db)
+):
+    stmt = select(Product)
+    if q:
+        stmt = stmt.where(Product.name.ilike(f"%{q}%"))
+    if category_id:
+        stmt = stmt.where(Product.category_id == category_id)
+    return db.scalars(stmt).all()
+
 
 @app.get("/products/{pid}", response_model=ProductOut)
 def get_product(pid: str, db: Session = Depends(get_db)):
@@ -222,4 +251,16 @@ def list_orders(user: User = Depends(get_current_user), db: Session = Depends(ge
             items=json.loads(o.items_json)
         ))
     return out
+
+@app.get("/categories", response_model=List[CategoryOut])
+def list_categories(db: Session = Depends(get_db)):
+    return db.scalars(select(Category).order_by(Category.name)).all()
+
+@app.post("/categories", response_model=CategoryOut)
+def create_category(body: CategoryIn, _: User = Depends(require_admin), db: Session = Depends(get_db)):
+    if db.scalar(select(Category).where(Category.slug == body.slug)):
+        raise HTTPException(400, "Slug already exists")
+    c = Category(name=body.name, slug=body.slug)
+    db.add(c); db.commit(); db.refresh(c)
+    return c
 
