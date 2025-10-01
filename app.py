@@ -17,7 +17,12 @@ ACCESS_TTL = 3600  # 1 hour
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # ======== DB (SQLite) ========
-engine = create_engine("sqlite:///./shop.db", connect_args={"check_same_thread": False})
+DB_URL = os.getenv("DATABASE_URL", "sqlite:///./shop.db")  # fallback for local
+if DB_URL.startswith("postgres://"):
+    # Render/Heroku style → SQLAlchemy expects postgresql://
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 class Base(DeclarativeBase): pass
@@ -308,4 +313,8 @@ def patch_inventory(
     p.inventory = new_qty
     db.commit()
     return {"ok": True, "inventory": p.inventory}
+
+@app.get("/healthz")
+def health():
+    return {"status": "ok"}
 
